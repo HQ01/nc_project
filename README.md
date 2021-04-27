@@ -1,1 +1,1 @@
-# nc_project
+# Neural Computation Final Project
