@@ -53,12 +53,12 @@ def load_stimuli_x(layer, subject, dataPath, augmentType):
 
     with open(dataPath / "data" / "ROIS" / "stim_lists" / "CSI0{}_stim_lists.txt".format(subject)) as f:
         stimulus_list = [item.strip("\n") for item in f.readlines()]
-    brain_response_idx = extract_brain_index(stimulus_list, dataset="imageNet") # this index a subset of brain response corresponding to the selected stimuli
+    brain_response_idx = np.array(extract_brain_index(stimulus_list, dataset="imagenet")) # this index a subset of brain response corresponding to the selected stimuli
     stimulus_to_order = {}
     img_order = np.load(dataPath / "data" / "image_order_index.npz")['arr_0']
     for i, name in enumerate(img_order):
         stimulus_to_order[name] = i
-    stimulus_tensor = torch.load(dataPath / "data" / augmentType / "x{}.pt".format(layer))
+    stimulus_tensor = np.load(dataPath / "data" / augmentType / "x{}.npy".format(layer))
     stimulus_list = np.array(stimulus_list)[brain_response_idx] # select the subset of viewed stimuli that correspond to ImageNet
     X = []
     for image_name in stimulus_list:

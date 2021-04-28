@@ -132,6 +132,7 @@ dmypy.json
 *.mat
 *.h5
 *.pt
+*.npy
 
 #misc
 .DS_Store
