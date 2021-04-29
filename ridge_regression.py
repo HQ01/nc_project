@@ -1,8 +1,29 @@
-from scipy.io import loadmat
 import argparse
 import numpy as np
 import torch
+import torch.nn.functional as F
 import pathlib
+import pickle
+import math
+from scipy.io import loadmat
+from sklearn.model_selection import (
+    KFold,
+    GroupKFold,
+    PredefinedSplit,
+    train_test_split,
+    GroupShuffleSplit,
+    ShuffleSplit,
+)
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+from scipy.stats import pearsonr
+from ridge import RidgeCVEstimator
+
+"""
+Code adapted from https://github.com/ariaaay/NeuralTaskonomy Author: Aria Wang et.al.
+"""
+
+ROIS = ["OPA", "PPA", "LOC", "EarlyVis", "RSC"]
+SIDE = ["LH", "RH"]
 
 def load_brain_y(subject, dataPath, TR=[3,4]):
     # Loading brain response for all viewed images and all ROIs for a specific subject and TR parameter.
@@ -14,8 +35,6 @@ def load_brain_y(subject, dataPath, TR=[3,4]):
         raise NotImplementedError
 
 def extract_brain_index(stim_list, dataset="all", rep=False):
-    # Code adapted from https://github.com/ariaaay/NeuralTaskonomy
-
     dataset_labels = []
     COCO_idx, imagenet_idx, SUN_idx = list(), list(), list()
     for i, n in enumerate(stim_list):
@@ -65,237 +84,75 @@ def load_stimuli_x(layer, subject, dataPath, augmentType):
         X.append(stimulus_tensor[stimulus_to_order[image_name], :])
     return np.array(X), brain_response_idx
 
+def parse_br(brain_response, br_index, side, roi):
+    #print(type(brain_response[0][side + roi]))
+    #print(brain_response[0][side + roi].shape)
+    #print(br_index.shape)
+    if len(brain_response) == 1:
+        return brain_response[0][side + roi][br_index, :]
+    else:
+        return (brain_response[0][side + roi][br_index, :] + brain_response[1][side + roi][br_index, :]) / 2
 
-# def get_features(subj, model, layer=None, dim=None, dataset="", br_subset_idx=None, indoor_only=False):
-#     print("Getting features for {}{}, for subject {}".format(model, layer, subj))
+def ridge_regression_with_cv(stimuli ,brain_response, cv=True, seed=42, ridge_lambdas = None, test_size=0.15, n_fold=7):
+    
+    performance_measure = lambda y, y_pred: -F.mse_loss(y_pred, y)
+    ridge_lambdas = torch.from_numpy(np.logspace(-8, 1 / 2 * np.log10(stimuli.shape[1]) + 8, 100)) if not ridge_lambdas else torch.from_numpy(ridge_lambdas)
+    stimuli_train, stimuli_test, br_train, br_test = train_test_split(stimuli, brain_response, test_size=test_size, random_state=seed)
 
-#     with open("../BOLD5000/CSI0{}_stim_lists.txt".format(subj)) as f:
-#         sl = f.readlines()
-#     stim_list = [item.strip("\n") for item in sl]
+    to_torch = lambda x: torch.from_numpy(x).to(dtype=torch.float64)
+    stimuli_train, stimuli_test, br_train = to_torch(stimuli_train), to_torch(stimuli_test), to_torch(br_train)
+    if cv:
+        kfold = KFold(n_splits=n_fold)
+    else:
+        train_index, _ = next(ShuffleSplit(test_size=test_size).split(stimuli_train, br_train))
+        # manually construct a train/val split
+        split_index = np.zeros(stimuli_train.shape[0])
+        split_index[train_index] = -1
+        kfold = PredefinedSplit(split_index)
+        assert kfold.get_n_splits() == 1
+    
+    ridgeModel = RidgeCVEstimator(ridge_lambdas, kfold, performance_measure, scale_X=False)
+    print("ridge regression model instance created")
+    print("stimuli_train shape: ", stimuli_train.shape)
+    print("brain response train shape: ", br_train.shape)
+    ridgeModel.fit(stimuli_train, br_train)
+    br_pred = ridgeModel.predict(stimuli_test).cpu().numpy()
+    r_squares = [r2_score(br_test[:,i], br_pred[:,i]) for i in range(br_test.shape[1])]
+    print("r_square stat: min {}, max {}, mean {}".format(min(r_squares), max(r_squares), sum(r_squares) / len(r_squares)))
+    correlations = [pearsonr(br_test[:,i], br_pred[:,i]) for i in range(br_test.shape[1])]
+    correlations_val = [item[0] for item in correlations]
+    print("pearson correlation stat: min {}, max {}, mean {}".format(min(correlations_val), max(correlations_val), sum(correlations_val) / len(correlations_val)))
 
-#     imgnet_idx, imgnet_cats = extract_dataset_index(sl, dataset="imagenet", rep=False)
-#     scene_idx, scene_cats = extract_dataset_index(sl, dataset="SUN", rep=False)
-#     COCO_idx, COCO_cats = extract_dataset_index(sl, dataset="COCO", rep=False)
+    return correlations, r_squares, ridgeModel.mean_cv_scores.cpu().numpy(), ridgeModel.best_l_scores.cpu().numpy(), ridgeModel.best_l_idxs.cpu().numpy(), [br_pred, br_test]
 
-#     # Load features list generated with the whole brain data. This dictionary includes: image names, valence responses,
-#     # reaction time, session number, etc.
-#     with open("{}/CSI{}_events.json".format(cortical_dir, subj)) as f:
-#         events = json.load(f)
+def experiment(stimuli, brain_response, brain_response_index, outputPath, cv=True, export=True, ROI="all", permute_y=False):
+    # ROI: list of all interested ROI or defaulted to All
+    selected_ROIS = ROIS if ROI == "all" else ROI
+    d_correlations, d_r_squares, d_mean_cv_scores, d_best_l_scores, d_best_l_idxs, d_predictions = {}, {}, {}, {}, {}, {}
+    for side in SIDE:
+        for roi in selected_ROIS:
+            print("doing experiment for {} and {}".format(side, roi))
+            brain_response_at_roi = parse_br(brain_response, brain_response_index, side, roi)
+            if permute_y:
+                print("\TODO: add permutation test support")
+                break
+            correlations, r_squares, mean_cv_scores, best_l_scores, best_l_idxs, predictions = ridge_regression_with_cv(stimuli, brain_response_at_roi, cv)
+            d_correlations[side+roi] = correlations
+            d_r_squares[side+roi] = r_squares
+            d_mean_cv_scores[side+roi] = mean_cv_scores
+            d_best_l_scores[side+roi] = best_l_scores
+            d_best_l_idxs[side+roi] = best_l_idxs
+            d_predictions[side+roi] = predictions # predictions => [prediction, ground truth]
 
-#     # events also has a stim list, it is same as the "stim_lists.txt"; but repetition is not indicated in the file name.
+    if export:
+        pickle.dump(d_correlations, open(outputPath / "correlations.pk", "wb"))
+        pickle.dump(d_r_squares, open(outputPath / "r_squares.pk", "wb"))
+        pickle.dump(d_mean_cv_scores, open(outputPath / "mean_cv_scores.pk", "wb"))
+        pickle.dump(d_best_l_scores, open(outputPath / "best_l_scores.pk", "wb"))
+        pickle.dump(d_best_l_idxs, open(outputPath / "best_l_idxs.pk", "wb"))
+        pickle.dump(d_predictions, open(outputPath / "predictions.pk", "wb"))
 
-#     # if indoor_only:
-#     #     with open("../BOLD5000_Stimuli/scene_indoor_cats.txt") as f:
-#     #         lst = f.readlines()
-#     #     indoor_scene_lst = [item.strip("\n") for item in lst]
-#     #     indoor_scene_idx = [
-#     #         i for i, s in enumerate(scene_cats) if s in indoor_scene_lst
-#     #     ]
-#     #     br_subset_idx = np.array(scene_idx)[indoor_scene_idx]
-#     #     stim_list = np.array(stim_list)[br_subset_idx]
-
-#     if (
-#             dataset is not ""
-#     ):  # only an argument for features spaces that applies to all
-#         if dataset == "ImageNet":
-#             br_subset_idx = imgnet_idx
-#             stim_list = np.array(stim_list)[imgnet_idx]
-#         elif dataset == "COCO":
-#             br_subset_idx = COCO_idx
-#             stim_list = np.array(stim_list)[COCO_idx]
-#         elif dataset == "SUN":
-#             br_subset_idx = scene_idx
-#             stim_list = np.array(stim_list)[scene_idx]
-
-
-#     if "convnet" in model or "scenenet" in model:
-
-#         # Load order of image features output from pre-trai[ned convnet or scenenet
-#         # (All layers has the same image order)
-#         image_order = pickle.load(
-#             open("../outputs/convnet_features/convnet_image_orders_fc7.p", "rb")
-#         )
-#         image_names = [im.split("/")[-1] for im in image_order]
-
-#         # Load Image Features
-#         if model == "convnet":
-#             if "conv" in layer:
-#                 feature_path = "../outputs/convnet_features/vgg19_avgpool_{}.npy".format(
-#                     layer
-#                 )
-#             else:
-#                 feature_path = "../outputs/convnet_features/vgg19__{}.npy".format(layer)
-#         # elif model == 'convnet_pca':
-#         #     if 'conv' in layer:
-#         #         feature_path = glob("../outputs/convnet_features/*eval_pca_black_{}.npy".format(layer))[0]
-#         #     else:
-#         #         feature_path = glob("../outptus/convnet_features/*eval_v2_{}*.npy".format(layer))[0]
-#         elif model == "scenenet":
-#             feature_path = "../outputs/scenenet_features/avgpool_{}.npy".format(layer)
-#         else:
-#             print("model is undefined: " + model)
-
-#         feature_mat = np.load(feature_path)
-#         assert len(image_order) == feature_mat.shape[0]
-
-#         featmat = []
-#         for img_name in stim_list:
-#             if "rep_" in img_name:
-#                 continue  # repeated images are NOT included in the training and testing sets
-#             # print(img_name)
-#             feature_index = image_names.index(img_name)
-#             featmat.append(feature_mat[feature_index, :])
-#         featmat = np.array(featmat)
-
-#         if br_subset_idx is None:
-#             br_subset_idx = get_nonrep_index(stim_list)
-
-#     elif "taskrepr" in model:
-#         # latent space in taskonomy, model should be in the format of "taskrep_X", e.g. taskrep_curvature
-#         task = "_".join(model.split("_")[1:])
-#         repr_dir = "../genStimuli/{}/".format(task)
-#         if indoor_only:
-#             task += "_indoor"
-
-#         featmat = []
-#         for img_name in stim_list:
-#             if "rep_" in img_name:
-#                 # print(img_name)
-#                 continue
-#             npyfname = img_name.split(".")[0] + ".npy"
-#             repr = np.load(repr_dir + npyfname).flatten()
-#             featmat.append(repr)
-#         featmat = np.array(featmat)
-
-#         if br_subset_idx is None:
-#             br_subset_idx = get_nonrep_index(stim_list)
-#         print(featmat.shape[0])
-#         print(len(br_subset_idx))
-#         assert featmat.shape[0] == len(br_subset_idx)
-
-#     elif model == "pic2vec":
-#         # only using ImageNet
-#         from gensim.models import KeyedVectors
-
-#         wv_model = KeyedVectors.load(
-#             "../outputs/models/pix2vec_{}.model".format(dim), mmap="r"
-#         )
-#         pix2vec = wv_model.vectors
-#         wv_words = list(wv_model.vocab)
-#         br_subset_idx, wv_idx = find_overlap(
-#             imgnet_cats, wv_words, imgnet_idx, unique=True
-#         )
-#         assert len(br_subset_idx) == len(wv_idx)
-#         featmat = pix2vec[wv_idx, :]
-
-#     elif model == "fasttext":
-#         # import gensim.downloader as api
-#         # model = api.load('fasttext-wiki-news-subwords-300')
-#         from gensim.models import KeyedVectors
-
-#         ft_model = KeyedVectors.load("../features/fasttext.model", mmap="r")
-#         if dataset == "SUN":
-#             cats = scene_cats
-#             idxes = scene_idx
-#         elif dataset == "ImageNet":
-#             cats = imgnet_cats
-#             idxes = imgnet_idx
-#         elif dataset == "":
-#             cats = imgnet_cats + scene_cats
-#             idxes = imgnet_idx + scene_idx
-
-#         featmat, br_subset_idx = [], []
-#         for i, c in enumerate(cats):
-#             word = c.split(".")[0]
-#             if "_" in word:
-#                 word = (
-#                     re.sub(r"(.)([A-Z])", r"\1-\2", word).replace("_", "-").lower()
-#                 )  # convert phrases to "X-Y"
-#             try:
-#                 featmat.append(ft_model[word])
-#                 br_subset_idx.append(idxes[i])
-#             except KeyError:
-#                 if "-" in word:
-#                     word = word.split("-")[0]  # try to find only "X"
-#                     try:
-#                         featmat.append(ft_model[word])
-#                         br_subset_idx.append(idxes[i])
-#                     except KeyError:
-#                         continue
-#                 else:
-#                     continue
-
-#         featmat = np.array(featmat)
-#         assert featmat.shape[0] == len(br_subset_idx)
-
-#     elif model == "response":
-#         featmat = np.array(events["valence"]).astype(np.float)
-#         featmat = featmat.reshape(len(featmat), 1)  # make it 2 dimensional
-
-#     elif model == "RT":
-#         featmat = np.array(events["RT"]).astype(np.float)
-#         featmat = featmat.reshape(len(featmat), 1)  # make it 2 dimensional
-
-#     elif model == "surface_normal_latent":
-#         sf_dir = "../genStimuli/rgb2sfnorm/"
-#         # load the pre-trained weights
-#         model_file = "../outputs/models/conv_autoencoder.pth"
-
-#         sf_model = Autoencoder()
-#         checkpoint = torch.load(model_file)
-#         sf_model.load_state_dict(checkpoint)
-#         sf_model.to(device)
-#         for param in sf_model.parameters():
-#             param.requires_grad = False
-#         sf_model.eval()
-
-#         featmat = []
-#         for img_name in stim_list:
-#             if "rep_" in img_name:
-#                 continue
-#             img = Image.open(sf_dir + img_name)
-#             inputs = Variable(preprocess(img).unsqueeze_(0)).to(device)
-#             feat = sf_model(inputs)[1]
-#             featmat.append(feat.cpu().numpy())
-#         featmat = np.squeeze(np.array(featmat))
-
-#         if br_subset_idx is None:
-#             br_subset_idx = get_nonrep_index(stim_list)
-
-#         assert featmat.shape[0] == len(br_subset_idx)
-
-#     elif model == "surface_normal_subsample":
-#         sf_dir = "../genStimuli/rgb2sfnorm/"
-
-#         featmat = []
-#         for img_name in stim_list:
-#             if "rep_" in img_name:
-#                 continue
-#             img = Image.open(sf_dir + img_name)
-#             inputs = Variable(preprocess(img).unsqueeze_(0))
-#             k = pool_size(inputs.data, 30000, adaptive=True)
-#             sub_sf = (
-#                 nn.functional.adaptive_avg_pool2d(inputs.data, (k, k))
-#                     .cpu()
-#                     .flatten()
-#                     .numpy()
-#             )
-#             featmat.append(sub_sf)
-
-#         featmat = np.squeeze(np.array(featmat))
-
-#         if br_subset_idx is None:
-#             br_subset_idx = get_nonrep_index(stim_list)
-
-#         assert featmat.shape[0] == len(br_subset_idx)
-
-#     else:
-#         raise NameError("Model not found.")
-
-#     return featmat, br_subset_idx
-
-
-
+    print("experiment done")
 
 
 if __name__ == "__main__":
@@ -303,6 +160,12 @@ if __name__ == "__main__":
         description="System identification with data augmentation"
     )
     # Data
+    parser.add_argument(
+        "--exp-name",
+        type=str,
+        default="default",
+        help="experiment name use to initialize log folder."
+    )
     parser.add_argument(
         "--layer",
         type=int,
@@ -376,14 +239,22 @@ if __name__ == "__main__":
 
     cur_path = pathlib.Path.cwd()
 
+    augmentType = "ReducedImageNetFeaturesFlipHorizontal"
+
     # load brain response
     brain_data = load_brain_y(args.subj, cur_path)
-    # print(brain_data[0][])
-    print(brain_data[0].keys())
-    print(type(brain_data[0]["RHPPA"]))
 
     # load processed stimuli
-    stimuli_repr, brain_response_idx = load_stimuli_x(args.layer, args.subj, cur_path, augmentType="ReducedImageNetFeaturesFlipHorizontal")
+    stimuli_repr, brain_response_idx = load_stimuli_x(args.layer, args.subj, cur_path, augmentType=augmentType)
 
-    print(stimuli_repr.shape)
+    outputPath = cur_path / "logs" / args.exp_name / "sub{}_layer{}_augment_{}".format(args.subj, args.layer, augmentType)
 
+    try:
+        outputPath.mkdir(parents=True, exist_ok=False)
+    except FileExistsError:
+        print("folder exist -- skip")
+    else:
+        print("New output path folder created")
+
+    experiment(stimuli_repr, brain_data, brain_response_idx, outputPath, ROI=["EarlyVis"]) # delete the ROI argument to get all ROIs' prediction
+        
