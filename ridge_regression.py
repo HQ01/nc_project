@@ -1,10 +1,13 @@
 import argparse
 import numpy as np
+import numpy.ma as ma
 import torch
 import torch.nn.functional as F
 import pathlib
 import pickle
 import math
+import tqdm
+import pandas as pd
 from scipy.io import loadmat
 from sklearn.model_selection import (
     KFold,
@@ -17,12 +20,15 @@ from sklearn.model_selection import (
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 from scipy.stats import pearsonr
 from ridge import RidgeCVEstimator
+from statsmodels.stats.multitest import fdrcorrection
+
 
 """
 Code adapted from https://github.com/ariaaay/NeuralTaskonomy Author: Aria Wang et.al.
 """
 
 ROIS = ["OPA", "PPA", "LOC", "EarlyVis", "RSC"]
+# ROIS = ["EarlyVis", "LOC"]
 SIDE = ["LH", "RH"]
 
 def load_brain_y(subject, dataPath, TR=[3,4]):
@@ -77,7 +83,7 @@ def load_stimuli_x(layer, subject, dataPath, augmentType):
     img_order = np.load(dataPath / "data" / "image_order_index.npz")['arr_0']
     for i, name in enumerate(img_order):
         stimulus_to_order[name] = i
-    stimulus_tensor = np.load(dataPath / "data" / augmentType / "x{}.npy".format(layer))
+    stimulus_tensor = np.load(dataPath / "data" / "feature_spaces" / augmentType / "x{}.npy".format(layer))
     stimulus_list = np.array(stimulus_list)[brain_response_idx] # select the subset of viewed stimuli that correspond to ImageNet
     X = []
     for image_name in stimulus_list:
@@ -125,10 +131,10 @@ def ridge_regression_with_cv(stimuli ,brain_response, cv=True, seed=42, ridge_la
 
     return correlations, r_squares, ridgeModel.mean_cv_scores.cpu().numpy(), ridgeModel.best_l_scores.cpu().numpy(), ridgeModel.best_l_idxs.cpu().numpy(), [br_pred, br_test]
 
-def experiment(stimuli, brain_response, brain_response_index, outputPath, cv=True, export=True, ROI="all", permute_y=False):
+def experiment(stimuli, brain_response, brain_response_index, outputPath, post_process=True, post_process_dict={}, layer="", ag_type="", cv=True, export=True, ROI="all", permute_y=False,):
     # ROI: list of all interested ROI or defaulted to All
     selected_ROIS = ROIS if ROI == "all" else ROI
-    d_correlations, d_r_squares, d_mean_cv_scores, d_best_l_scores, d_best_l_idxs, d_predictions = {}, {}, {}, {}, {}, {}
+    d_correlations, d_r_squares, d_mean_cv_scores, d_best_l_scores, d_best_l_idxs, d_predictions, d_masks = {}, {}, {}, {}, {}, {}, {}
     for side in SIDE:
         for roi in selected_ROIS:
             print("doing experiment for {} and {}".format(side, roi))
@@ -137,12 +143,33 @@ def experiment(stimuli, brain_response, brain_response_index, outputPath, cv=Tru
                 print("\TODO: add permutation test support")
                 break
             correlations, r_squares, mean_cv_scores, best_l_scores, best_l_idxs, predictions = ridge_regression_with_cv(stimuli, brain_response_at_roi, cv)
+
+            # fdr adjusted p value
+            correlations = np.array(correlations)
+            p = correlations[:, 1]
+            adjusted_p = fdrcorrection(p)[1]
+            correlations[:, 1] = adjusted_p
             d_correlations[side+roi] = correlations
+            corr_by_adjusted_p_mask = adjusted_p < 0.05
+            d_masks[side+roi] = corr_by_adjusted_p_mask
+
+
             d_r_squares[side+roi] = r_squares
             d_mean_cv_scores[side+roi] = mean_cv_scores
             d_best_l_scores[side+roi] = best_l_scores
             d_best_l_idxs[side+roi] = best_l_idxs
             d_predictions[side+roi] = predictions # predictions => [prediction, ground truth]
+            if post_process:
+                post_process_dict['idx'].append(ag_type + "_" + side+roi + "_" + str(layer))
+                mask_correlations = ma.masked_array(correlations[:, 0], mask=adjusted_p < 0.05)
+                post_process_dict["unmasked_mean"].append(float(np.mean(correlations[:, 0])))
+                post_process_dict["masked_mean"].append(float(mask_correlations.mean()))
+                post_process_dict["unmasked_count"].append(correlations.shape[0])
+                post_process_dict["masked_count"].append(int(np.sum(adjusted_p < 0.05)))
+
+                
+                
+        # get fdr corrected p values and export; compute correlation means for all voxels in an ROI and correlation means for masked voxels with significant corrected p-values
 
     if export:
         pickle.dump(d_correlations, open(outputPath / "correlations.pk", "wb"))
@@ -151,9 +178,7 @@ def experiment(stimuli, brain_response, brain_response_index, outputPath, cv=Tru
         pickle.dump(d_best_l_scores, open(outputPath / "best_l_scores.pk", "wb"))
         pickle.dump(d_best_l_idxs, open(outputPath / "best_l_idxs.pk", "wb"))
         pickle.dump(d_predictions, open(outputPath / "predictions.pk", "wb"))
-
-    print("experiment done")
-
+        pickle.dump(d_masks, open(outputPath / "mask.pk", "wb"))
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -163,7 +188,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--exp-name",
         type=str,
-        default="default",
+        default="completeSunMay02",
         help="experiment name use to initialize log folder."
     )
     parser.add_argument(
@@ -239,22 +264,72 @@ if __name__ == "__main__":
 
     cur_path = pathlib.Path.cwd()
 
-    augmentType = "ReducedImageNetFeaturesFlipHorizontal"
+    augmentTypes = ["ReducedImageNetFeatures", "ReducedImageNetFeaturesFlipHorizontal", "ReducedImageNetFeaturesFlipVertical", "ReducedImageNetFeaturesGaussianBlur", "ReducedImageNetFeaturesGaussianNoise", "ReducedImageNetFeaturesRandomCrop"]
+    # augmentTypes = ["ReducedImageNetFeatures", "ReducedImageNetFeaturesFlipHorizontal"]
+    subj_list = [1,2,3,4] #[1,2,3,4]
+    dfs = []
 
-    # load brain response
-    brain_data = load_brain_y(args.subj, cur_path)
-
-    # load processed stimuli
-    stimuli_repr, brain_response_idx = load_stimuli_x(args.layer, args.subj, cur_path, augmentType=augmentType)
-
-    outputPath = cur_path / "logs" / args.exp_name / "sub{}_layer{}_augment_{}".format(args.subj, args.layer, augmentType)
-
+    summary_path = cur_path / "logs" / args.exp_name / "summary"
     try:
-        outputPath.mkdir(parents=True, exist_ok=False)
+        summary_path.mkdir(parents=True, exist_ok=False)
     except FileExistsError:
         print("folder exist -- skip")
     else:
-        print("New output path folder created")
+        print("New summary path folder created")
 
-    experiment(stimuli_repr, brain_data, brain_response_idx, outputPath, ROI=["EarlyVis"]) # delete the ROI argument to get all ROIs' prediction
+
+
+    for subj in subj_list:
+        print("experimenting on subject {}..".format(subj))
+        post_process_dict = {}
+        post_process_dict['idx'] = []
+
+        for data_t in ["unmasked_mean", "masked_mean", "unmasked_count", "masked_count"]:  # then we have unmasked_difference and masked_difference as new columns
+            post_process_dict[data_t] = []
+
+        brain_data = load_brain_y(args.subj, cur_path)
+        for layer in [2, 5, 7, 9, 12]: #[2,5,7,9,12]
+            for ag_type in augmentTypes:
+                print("layer {}, ag_type: {}".format(layer, ag_type))
+                stimuli_repr, brain_response_idx = load_stimuli_x(layer, subj, cur_path, augmentType=ag_type)
+                outputPath = cur_path / "logs" / args.exp_name / "sub{}_layer{}_augment_{}".format(args.subj, args.layer, ag_type)
+                try:
+                    outputPath.mkdir(parents=True, exist_ok=False)
+                except FileExistsError:
+                    print("folder exist -- skip")
+                else:
+                    print("New output path folder created")
+                experiment(stimuli_repr, brain_data, brain_response_idx, outputPath, True, post_process_dict, layer=layer, ag_type=ag_type)
+        dfs.append(pd.DataFrame(post_process_dict))
+    
+    with pd.ExcelWriter(summary_path / "summary.xlsx".format(subj)) as writer:
+        for i in range(len(dfs)):
+            dfs[i].to_excel(writer, sheet_name='subj{}'.format(i+1))
+
+
+
+    # # load brain response
+    # brain_data = load_brain_y(args.subj, cur_path)
+
+    # # load processed stimuli
+    # stimuli_repr, brain_response_idx = load_stimuli_x(args.layer, args.subj, cur_path, augmentType=augmentType)
+
+    # outputPath = cur_path / "logs" / args.exp_name / "sub{}_layer{}_augment_{}".format(args.subj, args.layer, augmentType)
+
+    # try:
+    #     outputPath.mkdir(parents=True, exist_ok=False)
+    # except FileExistsError:
+    #     print("folder exist -- skip")
+    # else:
+    #     print("New output path folder created")
+
+    # experiment(stimuli_repr, brain_data, brain_response_idx, outputPath, ROI=["EarlyVis"]) # delete the ROI argument to get all ROIs' prediction
+
+
+
+    """
+    Code to-do list:
+    A for loop going through all subjects and all ROIs and all selected layers
+    For each, save statistical result. Create an independent function that export a csv file with all FDR-adjusted p values, and fingerprint for each ROIs
+    """
         
